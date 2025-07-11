@@ -13,7 +13,7 @@ import time
 
 from cs336_basics.BPETrainer import OptimizedBPETrainer
 from cs336_basics.Tokenizer import Tokenizer
-from cs336_basics.building_blocks import Linear
+from cs336_basics.building_blocks import Linear, Embedding
 
 
 def run_linear(
@@ -57,8 +57,11 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    embedding_layer = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
 
-    raise NotImplementedError
+    embedding_layer.load_state_dict({"embedding_matrix": weights})
+    return embedding_layer(token_ids)
+
 
 
 def run_swiglu(
