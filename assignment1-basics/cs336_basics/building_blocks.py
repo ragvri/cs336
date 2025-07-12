@@ -3,7 +3,7 @@ from torch import nn
 from einops import einsum, reduce, rearrange
 import math
 from torch import Tensor
-from jaxtyping import Float, Int
+from jaxtyping import Float, Int, Bool
 
 
 class Linear(nn.Module):
@@ -224,6 +224,38 @@ class RotaryPositionalEmbedding(nn.Module):
 
         x_rotated = rearrange([x_0_rotated, x_1_rotated], "p ... seq_len half_d_k -> ... seq_len (half_d_k p)")
         return x_rotated
+
+
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Compute softmax along a specified dimension.
+    Args:
+        x (torch.Tensor): Input tensor.
+        dim (int): Dimension of the input tensor along which to compute softmax.
+    Returns:
+        torch.Tensor: Softmax output tensor.
+    """
+    max_x = x.max(dim=dim, keepdim=True).values
+    exp_x = torch.exp(x - max_x)
+    return exp_x / exp_x.sum(dim=dim, keepdim=True)
+
+
+def scaled_dot_product_attention(
+    keys: Float[Tensor, "batch_size ... seq_len d_k"],
+    queries: Float[Tensor, "batch_size ... seq_len d_k"],
+    values: Float[Tensor, "batch_size ... seq_len d_v"],
+    mask: Bool[Tensor, "seq_len seq_len"] | None = None,
+) -> Float[Tensor, "batch_size ... queries d_v"]:
+    pre_softmax = einsum(queries, keys, "... queries d_k, ... keys d_k -> ... queries keys")
+    if mask is not None:
+        # mask is True for positions to keep, False for positions to mask, so we reverse
+        mask = ~mask
+        # add -inf to masked positions
+        pre_softmax = pre_softmax.masked_fill(mask, float("-inf")) / torch.sqrt(
+            torch.tensor(keys.shape[-1], dtype=keys.dtype, device=keys.device)
+        )
+    after_softmax = softmax(pre_softmax, dim=-1)
+    return einsum(after_softmax, values, "... queries seq_len, ... seq_len d_v -> ... queries d_v")
 
 
 if __name__ == "__main__":

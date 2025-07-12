@@ -13,7 +13,15 @@ import time
 
 from cs336_basics.BPETrainer import OptimizedBPETrainer
 from cs336_basics.Tokenizer import Tokenizer
-from cs336_basics.building_blocks import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding
+from cs336_basics.building_blocks import (
+    Linear,
+    Embedding,
+    RMSNorm,
+    SwiGLU,
+    RotaryPositionalEmbedding,
+    softmax,
+    scaled_dot_product_attention,
+)
 
 
 def run_linear(
@@ -114,7 +122,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(keys=K, queries=Q, values=V, mask=mask)
 
 
 def run_multihead_self_attention(
@@ -444,7 +452,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(
