@@ -13,7 +13,7 @@ import time
 
 from cs336_basics.BPETrainer import OptimizedBPETrainer
 from cs336_basics.Tokenizer import Tokenizer
-from cs336_basics.building_blocks import Linear, Embedding
+from cs336_basics.building_blocks import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding
 
 
 def run_linear(
@@ -63,7 +63,6 @@ def run_embedding(
     return embedding_layer(token_ids)
 
 
-
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -86,14 +85,15 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu_layer = SwiGLU(d_model=d_model, d_ff=d_ff)
+    swiglu_layer.load_state_dict(
+        {
+            "linear1.W": w1_weight,
+            "linear2.W": w2_weight,
+            "linear3.W": w3_weight,
+        }
+    )
+    return swiglu_layer(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -210,7 +210,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope_layer = RotaryPositionalEmbedding(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
+    return rope_layer(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -388,7 +389,9 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms_norm = RMSNorm(d_model=d_model, eps=eps)
+    rms_norm.load_state_dict({"gain": weights})
+    return rms_norm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
