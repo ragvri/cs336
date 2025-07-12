@@ -251,11 +251,102 @@ def scaled_dot_product_attention(
         # mask is True for positions to keep, False for positions to mask, so we reverse
         mask = ~mask
         # add -inf to masked positions
-        pre_softmax = pre_softmax.masked_fill(mask, float("-inf")) / torch.sqrt(
-            torch.tensor(keys.shape[-1], dtype=keys.dtype, device=keys.device)
-        )
+        pre_softmax = pre_softmax.masked_fill(mask, float("-inf"))
+
+    # Scale by sqrt(d_k)
+    pre_softmax = pre_softmax / torch.sqrt(torch.tensor(keys.shape[-1], dtype=keys.dtype, device=keys.device))
+
     after_softmax = softmax(pre_softmax, dim=-1)
     return einsum(after_softmax, values, "... queries seq_len, ... seq_len d_v -> ... queries d_v")
+
+
+class MultiHeadCausalSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        token_positions: Int[Tensor, "... seq_len"] | None = None,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
+    ):
+        """
+        Construct a multi-head causal self-attention module
+        Args:
+            d_model (int): dimension of the model
+            num_heads (int): number of attention heads
+            theta (float, optional): constant for the RoPE, if None, RoPE is not used
+            device (torch.device, optional): device to create the module on.
+            dtype (torch.dtype, optional): data type of the module parameters
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.device = device
+        self.dtype = dtype
+        self.token_positions = token_positions
+
+        self.query = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
+        self.key = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
+        self.value = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
+
+        self.w_o = Linear(in_features=self.num_heads * self.d_k, out_features=self.d_model, device=device, dtype=dtype)
+
+        self.rope = None
+
+        if theta is not None:
+            assert max_seq_len is not None, "max_seq_len must be provided if theta is specified"
+            self.rope = RotaryPositionalEmbedding(theta=theta, d_k=self.d_k, max_seq_len=max_seq_len, device=device)
+
+    def forward(
+        self, x: Float[Tensor, "... seq_len d_model"], token_positions: Int[Tensor, "... seq_len"] | None = None
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        """
+        Forward pass of the multi-head causal self-attention layer
+        Args:
+            x (torch.Tensor): input tensor of shape (..., seq_len, d_model)
+        Returns:
+            torch.Tensor: output tensor of shape (..., seq_len, d_model)
+        """
+
+        queries = rearrange(
+            self.query(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
+        )
+
+        keys = rearrange(
+            self.key(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
+        )
+
+        values = rearrange(
+            self.value(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
+        )
+
+        if self.rope:
+            # apply rope to queries and keys
+            if token_positions is None:
+                token_positions = torch.arange(x.shape[-2], device=self.device, dtype=torch.int32)
+            queries = self.rope(queries, token_positions)
+            keys = self.rope(keys, token_positions)
+
+        # get mask with tril
+        # mask is True for positions to keep, False for positions to mask
+        mask = torch.tril(torch.ones((x.shape[-2], x.shape[-2]), device=self.device, dtype=torch.bool), diagonal=0)
+
+        # compute attention
+        attention_output = scaled_dot_product_attention(
+            keys=keys,
+            queries=queries,
+            values=values,
+            mask=mask,  # no mask for causal self-attention
+        )
+
+        attention_output = rearrange(
+            attention_output, "... num_heads seq_len d_k -> ... seq_len (num_heads d_k)", num_heads=self.num_heads
+        )
+
+        return self.w_o(attention_output)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from cs336_basics.building_blocks import (
     RotaryPositionalEmbedding,
     softmax,
     scaled_dot_product_attention,
+    MultiHeadCausalSelfAttention,
 )
 
 
@@ -156,7 +157,21 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    multihead_causal_self_attention = MultiHeadCausalSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    multihead_causal_self_attention.load_state_dict(
+        {
+            "query.W": q_proj_weight,
+            "key.W": k_proj_weight,
+            "value.W": v_proj_weight,
+            "w_o.W": o_proj_weight,
+        }
+    )
+    return multihead_causal_self_attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -196,7 +211,26 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mulihead_causal_self_attention = MultiHeadCausalSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        theta=theta,
+        max_seq_len=max_seq_len,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    mulihead_causal_self_attention.load_state_dict(
+        {
+            "query.W": q_proj_weight,
+            "key.W": k_proj_weight,
+            "value.W": v_proj_weight,
+            "w_o.W": o_proj_weight,
+        }
+    )
+    return mulihead_causal_self_attention(
+        in_features,
+        token_positions=token_positions,
+    )
 
 
 def run_rope(
