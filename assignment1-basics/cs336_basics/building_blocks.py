@@ -19,14 +19,14 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.W = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype), requires_grad=True)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype), requires_grad=True)
 
         # initialize the parameter to normal distribution with mean 0, sigma^2 = 2/(d_in + d_out) truncated to [-3sigma, 3sigma]
         std = (2.0 / (in_features + out_features)) ** 0.5
-        nn.init.trunc_normal_(self.W, mean=0.0, std=std, a=-3.0 * std, b=3.0 * std)
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3.0 * std, b=3.0 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return einsum(x, self.W, "... in_features, out_features in_features -> ... out_features")
+        return einsum(x, self.weight, "... in_features, out_features in_features -> ... out_features")
 
 
 class Embedding(nn.Module):
@@ -50,12 +50,12 @@ class Embedding(nn.Module):
         self.embedding_dim = embedding_dim
 
         # initialize the embedding matrix
-        self.embedding_matrix = nn.Parameter(
+        self.weight = nn.Parameter(
             torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype), requires_grad=True
         )
         # use normal distribution with mean 0, std = 1, truncated to [-3, 3]
         std = 1.0
-        nn.init.trunc_normal_(self.embedding_matrix, mean=0.0, std=std, a=-3.0 * std, b=3.0 * std)
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3.0 * std, b=3.0 * std)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """
@@ -65,7 +65,7 @@ class Embedding(nn.Module):
         Returns:
             torch.Tensor: embedded vectors for the input indices
         """
-        return self.embedding_matrix[indices]
+        return self.weight[indices]
 
 
 class RMSNorm(nn.Module):
@@ -83,7 +83,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.eps = eps
-        self.gain = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype), requires_grad=True)
+        self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype), requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -102,7 +102,7 @@ class RMSNorm(nn.Module):
         denominator = torch.rsqrt(variance + self.eps)
         denominator = rearrange(denominator, "batch_size sequence_length -> batch_size sequence_length 1")
 
-        result = x * denominator * self.gain
+        result = x * denominator * self.weight
 
         return result.to(in_dtype)  # convert back to original dtype
 
@@ -128,9 +128,9 @@ class SwiGLU(nn.Module):
             d_ff = 8 / 3 * d_model  # hidden dimension is 8/3 times the input dimension
             # ensure it is multiple of 64
             d_ff = math.ceil(d_ff / 64) * 64
-        self.linear1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
-        self.linear3 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
-        self.linear2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
+        self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+        self.w3 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
 
     def _swilu(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -150,10 +150,10 @@ class SwiGLU(nn.Module):
         Returns:
             torch.Tensor: output tensor after applying SwiGLU
         """
-        swish = self._swilu(self.linear1(x))
+        swish = self._swilu(self.w1(x))
 
-        glu_part = swish * self.linear3(x)
-        result = self.linear2(glu_part)
+        glu_part = swish * self.w3(x)
+        result = self.w2(glu_part)
         return result
 
 
@@ -288,11 +288,11 @@ class MultiHeadCausalSelfAttention(nn.Module):
         self.dtype = dtype
         self.token_positions = token_positions
 
-        self.query = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
-        self.key = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
-        self.value = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
+        self.q_proj = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
+        self.k_proj = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
+        self.v_proj = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
 
-        self.w_o = Linear(in_features=self.num_heads * self.d_k, out_features=self.d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(in_features=self.num_heads * self.d_k, out_features=self.d_model, device=device, dtype=dtype)
 
         self.rope = None
 
@@ -312,15 +312,15 @@ class MultiHeadCausalSelfAttention(nn.Module):
         """
 
         queries = rearrange(
-            self.query(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
+            self.q_proj(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
         )
 
         keys = rearrange(
-            self.key(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
+            self.k_proj(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
         )
 
         values = rearrange(
-            self.value(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
+            self.v_proj(x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads
         )
 
         if self.rope:
@@ -346,7 +346,135 @@ class MultiHeadCausalSelfAttention(nn.Module):
             attention_output, "... num_heads seq_len d_k -> ... seq_len (num_heads d_k)", num_heads=self.num_heads
         )
 
-        return self.w_o(attention_output)
+        return self.output_proj(attention_output)
+
+
+class PreNormTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """
+        Construct a pre-norm transformer block
+        Args:
+            d_model (int): dimension of the model
+            num_heads (int): number of attention heads
+            d_ff (int): hidden dimension for the position wise feed-forward network
+            theta (float, optional): rotary embedding parameter
+            max_seq_len (int, optional): maximum sequence length
+            device (torch.device, optional): device to create the module on.
+            dtype (torch.dtype, optional): data type of the module parameters
+        """
+        super().__init__()
+        self.attn = MultiHeadCausalSelfAttention(
+            d_model=d_model, num_heads=num_heads, device=device, dtype=dtype, theta=theta, max_seq_len=max_seq_len
+        )
+        self.ln1 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+
+    def forward(
+        self, x: Float[Tensor, "... seq_len d_model"], token_positions: Int[Tensor, "... seq_len"] | None = None
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        """
+        Forward pass of the pre-norm transformer block
+        Args:
+            x (torch.Tensor): input tensor of shape (..., seq_len, d_model)
+            token_positions (torch.Tensor): positions of the tokens in the sequence.
+        Returns:
+            torch.Tensor: output tensor of shape (..., seq_len, d_model)
+        """
+        rms_normed = self.ln1(x)
+        attention_output = self.attn(rms_normed, token_positions=token_positions)
+        residual_attention = x + attention_output
+
+        rms_normed_ffn = self.ln2(residual_attention)
+        ffn_output = self.ffn(rms_normed_ffn)
+        final_output = residual_attention + ffn_output
+
+        return final_output
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        context_length: int,
+        num_layers: int,
+        num_heads: int = 8,
+        d_ff: int | None = None,
+        rope_theta: float | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """
+        Construct a Transformer Language Model
+        Args:
+            vocab_size (int): size of the vocabulary
+            d_model (int): dimension of the model
+            context_length (int): maximum context length for the model to determine the dimensionality of the
+                                  position embedding matrix
+            num_layers (int): number of transformer blocks to use
+            num_heads (int): number of attention heads in each transformer block
+            rope_theta (float, optional): constant for the RoPE, if None, RoPE is not used
+            device (torch.device, optional): device to create the module on.
+            dtype (torch.dtype, optional): data type of the module parameters
+        """
+        super().__init__()
+        self.token_embeddings = Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype)
+
+        if d_ff is None:
+            d_ff = (8 / 3) * d_model  # default hidden dimension for feed-forward network
+            d_ff = math.ceil(d_ff / 64) * 64
+
+        self.layers = nn.ModuleList(
+            [
+                PreNormTransformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    max_seq_len=context_length,
+                    theta=rope_theta,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.ln_final = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+
+        self.lm_head = Linear(in_features=d_model, out_features=vocab_size, device=device, dtype=dtype)
+
+    def forward(
+        self, x: Int[Tensor, "... seq_len"], token_positions: Int[Tensor, "... seq_len"] | None = None
+    ) -> Float[Tensor, "... seq_len vocab_size"]:
+        """
+        Forward pass of the Transformer Language Model
+        Args:
+            x (torch.Tensor): input tensor of shape (..., seq_len) containing token indices
+            token_positions (torch.Tensor): positions of the tokens in the sequence.
+        Returns:
+            torch.Tensor: output tensor of shape (..., seq_len, vocab_size) containing probabilities for
+            each token in the vocabulary
+        """
+
+        embedded_tokens = self.token_embeddings(x)
+        transformer_layer_output = embedded_tokens
+        for layer in self.layers:
+            transformer_layer_output = layer(transformer_layer_output, token_positions=token_positions)
+
+        normed_output = self.ln_final(transformer_layer_output)
+        lm_output = self.lm_head(normed_output)
+
+        return lm_output
 
 
 if __name__ == "__main__":
