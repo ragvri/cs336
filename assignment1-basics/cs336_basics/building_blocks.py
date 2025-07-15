@@ -1,8 +1,13 @@
+from collections.abc import Callable
+import os
+from typing import BinaryIO, Union
 import torch
 from torch import nn
 from einops import einsum, reduce, rearrange
 import math
 from torch import Tensor
+import numpy as np
+import click
 from jaxtyping import Float, Int, Bool
 
 
@@ -19,7 +24,9 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype), requires_grad=True)
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, device=device, dtype=dtype), requires_grad=True
+        )
 
         # initialize the parameter to normal distribution with mean 0, sigma^2 = 2/(d_in + d_out) truncated to [-3sigma, 3sigma]
         std = (2.0 / (in_features + out_features)) ** 0.5
@@ -292,7 +299,9 @@ class MultiHeadCausalSelfAttention(nn.Module):
         self.k_proj = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
         self.v_proj = Linear(in_features=d_model, out_features=num_heads * self.d_k, device=device, dtype=dtype)
 
-        self.output_proj = Linear(in_features=self.num_heads * self.d_k, out_features=self.d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(
+            in_features=self.num_heads * self.d_k, out_features=self.d_model, device=device, dtype=dtype
+        )
 
         self.rope = None
 
@@ -477,8 +486,323 @@ class TransformerLM(nn.Module):
         return lm_output
 
 
+def cross_entropy_loss(
+    predicted_logits: Float[Tensor, "b vocab_size"],
+    target_indices: Int[Tensor, " b"],
+) -> Float[Tensor, ""]:
+    """
+    Compute the avg cross-entropy loss for the predicted logits and target indices.
+    l_i = -log(softmax(predicted_logits for the target_indices))
+    Args:
+        predicted_logits (torch.Tensor): Predicted logits of shape (batch_size, vocab_size).
+        target_indices (torch.Tensor): Target indices of shape (batch_size,).
+    Returns:
+        torch.Tensor: Cross-entropy loss value (scalar).
+    """
+    # Use log-sum-exp trick for numerical stability
+    # Extract target logits
+    target_logits = predicted_logits[range(predicted_logits.shape[0]), target_indices]
+
+    # Compute log-sum-exp: log(sum(exp(x_i))) = max(x) + log(sum(exp(x_i - max(x))))
+    max_logits = reduce(predicted_logits, "b vocab_size -> b 1", "max")
+    exp_shifted = torch.exp(predicted_logits - max_logits)
+    sum_exp = reduce(exp_shifted, "b vocab_size -> b", "sum")
+    log_sum_exp = max_logits + torch.log(sum_exp)
+
+    # Cross-entropy: -target_logit + log_sum_exp
+
+    return (-target_logits + log_sum_exp).mean()
+
+
+class AdamW(torch.optim.Optimizer):
+    """
+    AdamW optimizer.
+    Formula:
+    m_t = beta_1 * m_{t-1} + (1 - beta_1) * g_t
+    v_t = beta_2 * v_{t-1} + (1 - beta_2) * g_t^2
+    theta_t = theta_{t-1} - alpha * m_t / (sqrt(v_t) + eps) - alpha * lamda * theta_{t-1}
+    where:
+    - m_t is the first moment (mean of gradients)
+    - v_t is the second moment (variance of gradients)
+    - g_t is the gradient at time t
+    - theta_t is the parameter at time t
+    - alpha is the learning rate
+    - eps is a small value for numerical stability
+    - lamda is the weight decay factor
+    Args:
+        torch.optim.Optimizer: Base class for all optimizers in PyTorch.
+    """
+
+    def __init__(self, params, lr: float, betas: tuple[float], eps: float, weight_decay: float):
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable | None = None):
+        """
+        Perform a single optimization step.
+        Args:
+            closure (callable, optional): A closure that reevaluates the model and returns the loss.
+        """
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            betas = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+
+                state = self.state[param]  # get the state of the parameter
+                time_step = state.get("t", 1)  # get the iteration count for the parameter
+                moment = state.get("m", torch.zeros_like(param.data))
+                second_moment = state.get("v", torch.zeros_like(param.data))
+
+                # update first and second moments
+                gradient = param.grad.data
+                moment = betas[0] * moment + (1 - betas[0]) * gradient
+                second_moment = betas[1] * second_moment + (1 - betas[1]) * gradient**2
+
+                alpha_t = lr * math.sqrt(1 - betas[1] ** time_step) / (1 - betas[0] ** time_step)
+
+                # update the parameter
+                param.data = param.data - alpha_t * moment / (second_moment.sqrt() + eps)
+                # apply weight decay
+                param.data = param.data - lr * weight_decay * param.data
+
+                # update the states
+                state["t"] = time_step + 1  # increment the iteration count for the parameter
+                state["m"] = moment
+                state["v"] = second_moment
+
+        return loss  # return the loss if closure is provided, else None
+
+
+def cosine_annealing_lr_schedule(
+    t: int,
+    alpha_max: float,
+    alpha_min: float,
+    warmup_steps: int,
+    cosine_annealing_steps: int,
+) -> float:
+    """
+    Compute the learning rate using cosine annealing schedule with warmup.
+    Args:
+        t (int): current step in the training process
+        alpha_max (float): maximum learning rate
+        alpha_min (float): minimum learning rate
+        warmup_steps (int): number of steps for the warmup phase
+        cosine_annealing_steps (int): number of steps for the cosine annealing phase
+    Returns:
+        float: learning rate for the current step
+    """
+    if t < warmup_steps:
+        return alpha_max * t / warmup_steps
+    elif warmup_steps <= t <= cosine_annealing_steps:
+        return alpha_min + 0.5 * (alpha_max - alpha_min) * (
+            1 + math.cos(((t - warmup_steps) / (cosine_annealing_steps - warmup_steps)) * math.pi)
+        )
+    return alpha_min  # after the cosine annealing phase, return the minimum learning rate
+
+
+def gradient_clipping(
+    parameters: list[torch.nn.Parameter],
+    max_norm: float,
+) -> None:
+    """
+    Clip gradients of the parameters to prevent exploding gradients.
+    If the combined l2 norm of all gradients exceeds max_norm, all gradients are scaled down
+    by a factor of (max_norm / total_norm)
+    Args:
+        parameters (list[torch.nn.Parameter]): List of parameters to clip gradients for.
+        max_norm (float): Maximum norm for the gradients.
+    """
+    # Calculate total norm across all parameters
+    total_norm = 0.0
+    for param in parameters:
+        if param.grad is not None:
+            total_norm += param.grad.data.norm(2) ** 2
+    total_norm = total_norm**0.5
+
+    # If total norm exceeds max_norm, scale all gradients
+    if total_norm > max_norm:
+        clip_coef = max_norm / (total_norm + 1e-6)
+        for param in parameters:
+            if param.grad is not None:
+                param.grad.data.mul_(clip_coef)
+    return None
+
+
+def load_data(
+    x: np.ndarray, batch_size: int, context_len: int, device: torch.device
+) -> tuple[Int[Tensor, " batch_size context_len"], Int[Tensor, " batch_size context_len"]]:
+    """
+    Load data into batches for training.
+    Args:
+        x (np.ndarray): Input numpy array with tokens.
+        batch_size (int): Size of each batch.
+        context_len (int): Length of the context for each sample.
+        device (torch.device): Device to load the data onto.
+    Returns:
+        tuple: A tuple containing:
+            - Int[Tensor, " batch_size context_len"]: Input tensor of shape (batch_size, context_len).
+            - Int[Tensor, " batch_size context_len"]: Target tensor of shape (batch_size, context_len).
+    """
+
+    # choose b random starting indices for the batches from 0 to len(x) - context_len
+    start_indices = np.random.randint(0, len(x) - context_len, size=batch_size)
+
+    # create input and target tensors
+    input_tensor = torch.tensor(
+        [x[start_idx : start_idx + context_len] for start_idx in start_indices],
+        dtype=torch.int32,
+        device=device,
+    )
+    # for each start index, the target is the next token in the sequence
+    target_tensor = torch.tensor(
+        [x[start_idx + 1 : start_idx + context_len + 1] for start_idx in start_indices],
+        dtype=torch.int32,
+        device=device,
+    )
+    return input_tensor, target_tensor
+
+
+def save_checkpoint(
+    model: nn.Module, optimizer: torch.optim.Optimizer, iteration: int, out: BinaryIO | str | os.PathLike[str]
+) -> None:
+    """
+    Save the model and optimizer state to a checkpoint file.
+    Args:
+        model (nn.Module): The model to save.
+        optimizer (torch.optim.Optimizer): The optimizer to save.
+        iteration (int): Current iteration number for naming the checkpoint file.
+        out (Union[BinaryIO, str, os.PathLike[str]]): Output path or file-like object to save the checkpoint.
+    """
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
+
+
+def load_checkpoint(
+    src: BinaryIO | str | os.PathLike[str],
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    """
+    Load the model and optimizer state from a checkpoint file.
+    Args:
+        src (Union[BinaryIO, str, os.PathLike[str]]): Source path or file-like object to load the checkpoint from.
+        model (nn.Module): The model to load the state into.
+        optimizer (torch.optim.Optimizer): The optimizer to load the state into.
+    Returns:
+        int: The iteration number from the checkpoint.
+    """
+    checkpoint = torch.load(src, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return checkpoint["iteration"]  # return the iteration number from the checkpoint
+
+
+@click.command()
+@click.option("--dataset", type=str, required=True, help="Path to the dataset file.")
+@click.option("--batch_size", type=int, default=32, help="Batch size for training.")
+@click.option("--vocab_size", type=int, default=10000, help="Size of the vocabulary.")
+@click.option("--context_length", type=int, default=1024, help="Context length for the model.")
+@click.option("--d_model", type=int, default=512, help="Dimension of the model")
+@click.option("--num_layers", type=int, default=6, help="Number of transformer layers.")
+@click.option("--num_heads", type=int, default=8, help="Number of attention heads.")
+@click.option(
+    "--d_ff",
+    type=int,
+    default=None,
+    help="Hidden dimension for the feed-forward network. If None, defaults to 8/3 * d_model.",
+)
+@click.option("--rope_theta", type=float, default=None, help="Constant for the RoPE. If None, RoPE is disabled.")
+@click.option("--device", type=str, default="cpu", help="Device to run the training on (e.g., 'cpu' or 'cuda').")
+@click.option("--output_dir", type=str, default="checkpoints", help="Directory to save checkpoints.")
+@click.option("--iterations", type=int, default=1000, help="Number of training iterations.")
+def train(
+    dataset: str,
+    batch_size: int,
+    vocab_size: int,
+    context_length: int,
+    d_model: int,
+    num_layers: int,
+    num_heads: int,
+    d_ff: int | None = None,
+    rope_theta: float | None = None,
+    device: str = "cpu",
+    output_dir: str = "checkpoints",
+    iterations: int = 1000,
+):
+    """
+    Train a Transformer Language Model on the given dataset.
+    """
+    device = torch.device(device)
+
+    # Load dataset
+    x = np.memmap(dataset, dtype=np.int32, mode="r")
+    # Initialize model and optimizer
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        context_length=context_length,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=device,
+    ).to(device)
+
+    for iteration in range(iterations):
+        # Load data
+        input_tensor, target_tensor = load_data(x, batch_size, context_length, device)
+
+        # Forward pass
+        logits = model(input_tensor)
+
+        # Compute loss
+        loss = cross_entropy_loss(logits.view(-1, vocab_size), target_tensor.view(-1))
+
+        lr = cosine_annealing_lr_schedule(
+            t=iteration,
+            alpha_max=1e-1,
+            alpha_min=1e-5,
+            warmup_steps=100,
+            cosine_annealing_steps=iterations,
+        )
+        optimizer = AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=1e-2)
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        gradient_clipping(model.parameters(), max_norm=4.0)
+        optimizer.step()
+
+        print(f"Iteration {iteration + 1}/{iterations}, Loss: {loss.item()}")
+
+        # Save checkpoint every 100 iterations
+        if (iteration + 1) % 100 == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            checkpoint_path = os.path.join(output_dir, f"checkpoint_{iteration + 1}.pt")
+            save_checkpoint(model, optimizer, iteration + 1, checkpoint_path)
+
+
 if __name__ == "__main__":
-    # Example usage
-    linear_layer = Linear(in_features=4, out_features=2)
-    # get state dict for weights
-    print(linear_layer.state_dict())
+    weights = torch.nn.Parameter(5 * torch.randn((10, 10)))
+    opt = AdamW([weights], lr=1e3)
+
+    for _ in range(100):
+        opt.zero_grad()  # reset gradients for all learning parameters
+        loss = (weights**2).mean()  # compute the loss
+        print(f"Loss: {loss.item()}")
+        loss.backward()  # compute gradients
+        opt.step()  # update parameters using the optimizer
