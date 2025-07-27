@@ -6,7 +6,7 @@ import regex as re
 
 logger = logging.getLogger(__name__)
 # change the logging level to DEBUG to see debug messages
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 
 class Tokenizer:
@@ -71,58 +71,56 @@ class Tokenizer:
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens=None):
         """
-        Class method to create a tokenizer from a serialized vocabulary and merges files.
+        Class method to create a tokenizer from serialized vocabulary and merges files.
         Args:
-            vocab_filepath (str): Path to the vocabulary file.
-            merges_filepath (str): Path to the merges file.
+            vocab_filepath (str): Path to the vocabulary file (.pkl or .json).
+            merges_filepath (str): Path to the merges file (.pkl or .json).
             special_tokens (list[str] | None): List of special tokens to be used in the tokenizer.
         """
-        import json
+        import pickle
 
-        # Load vocabulary from JSON file
-        with open(vocab_filepath) as f:
-            vocab_json = json.load(f)
+        # Load from pickle files
+        with open(vocab_filepath, "rb") as f:
+            vocab = pickle.load(f)
 
-        # Convert vocabulary back to proper format (int keys, bytes values)
-        vocab = {}
-        for k, v in vocab_json.items():
-            vocab[int(k)] = v.encode("utf-8")
-
-        # Load merges from JSON file
-        with open(merges_filepath) as f:
-            merges_json = json.load(f)
-
-        # Convert merges back to proper format (tuple of bytes)
-        merges = []
-        for pair in merges_json:
-            merges.append((pair[0].encode("utf-8"), pair[1].encode("utf-8")))
+        with open(merges_filepath, "rb") as f:
+            merges = pickle.load(f)
 
         return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
     def _apply_merges(self, tokens: tuple[bytes]) -> tuple[bytes]:
         """
-        Applies merges to the tokens in the order we obtained them
+        Applies merges to the tokens in the order we obtained them - optimized version
         """
-        for merge in self.merges:
-            # Keep applying this merge until no more instances are found
-            while True:
-                logger.debug(f"trying to merge: {merge}")
-                # Recompute the pairs after each merge
-                pairs = list(zip(tokens, tokens[1:]))
-                logger.debug(f"pairs: {pairs}")
-                if merge not in pairs:
-                    break
-                logger.debug(f"Found merge pair: {merge}")
+        current_tokens = tokens
 
-                # Find the first occurrence of the merge pair
-                for i in range(len(tokens) - 1):
-                    if tokens[i] == merge[0] and tokens[i + 1] == merge[1]:
-                        # Perform the merge at position i
-                        tokens = tokens[:i] + (merge[0] + merge[1],) + tokens[i + 2 :]
-                        logger.debug(f"Merged {merge} into {tokens}")
-                        logger.debug(f"Tokens after merge: {tokens}")
-                        break
-        return tokens
+        for merge in self.merges:
+            if len(current_tokens) < 2:
+                break
+                
+            merge_pair = (merge[0], merge[1])
+            merged_token = merge[0] + merge[1]
+            
+            # Early exit if merge pair not present
+            if merge_pair[0] not in current_tokens or merge_pair[1] not in current_tokens:
+                continue
+
+            new_tokens = []
+            i = 0
+            
+            while i < len(current_tokens):
+                if (i < len(current_tokens) - 1 and 
+                    current_tokens[i] == merge_pair[0] and 
+                    current_tokens[i + 1] == merge_pair[1]):
+                    new_tokens.append(merged_token)
+                    i += 2
+                else:
+                    new_tokens.append(current_tokens[i])
+                    i += 1
+            
+            current_tokens = tuple(new_tokens)
+
+        return current_tokens
 
     def encode(self, text: str) -> list[int]:
         encoded_tokens = []
@@ -143,7 +141,10 @@ class Tokenizer:
                         encoded_tokens.append(self.inv_vocab[token])
                     else:
                         logger.warning(f"Token {token} not found in vocabulary.")
-                        encoded_tokens.append(self.inv_vocab.get(b"<unk>", -1))
+                        # This should not happen with properly serialized vocabulary
+                        raise ValueError(
+                            f"Token {token} not found in vocabulary. This indicates a vocabulary corruption."
+                        )
             logger.debug("finished!!\n\n")
 
         return encoded_tokens
@@ -169,10 +170,102 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    text = "the cat ate"
-    vocab = {0: b" ", 1: b"a", 2: b"c", 3: b"e", 4: b"h", 5: b"t", 6: b"th", 7: b" c", 8: b" a", 9: b"the", 10: b" at"}
-    merges = [(b"t", b"h"), (b" ", b"c"), (b" ", b"a"), (b"th", b"e"), (b" a", b"t")]
-    tokenizer = Tokenizer(vocab=vocab, merges=merges, special_tokens={})
-    encoded = tokenizer.encode(text)
+    # text = "the cat ate"
+    # vocab = {0: b" ", 1: b"a", 2: b"c", 3: b"e", 4: b"h", 5: b"t", 6: b"th", 7: b" c", 8: b" a", 9: b"the", 10: b" at"}
+    # merges = [(b"t", b"h"), (b" ", b"c"), (b" ", b"a"), (b"th", b"e"), (b" a", b"t")]
+    # tokenizer = Tokenizer(vocab=vocab, merges=merges, special_tokens={})
+    # encoded = tokenizer.encode(text)
+    import time
 
-    print(encoded)
+    start_time = time.time()
+    tokenizer = Tokenizer.from_files(
+        vocab_filepath="./data/bpe_vocab_TinyStoriesV2-GPT4-train.txt.pkl",
+        merges_filepath="./data/bpe_merges_TinyStoriesV2-GPT4-train.txt.pkl",
+        special_tokens=["<|endoftext|>"],
+    )
+
+    import numpy as np
+    import os
+    import tempfile
+
+    # Dynamic memory-mapped array approach
+    initial_capacity = 10_000_000  # Start with 10M tokens (20MB)
+    capacity = initial_capacity
+    token_count = 0
+
+    # Create temporary memmap file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.dat')
+    temp_path = temp_file.name
+    temp_file.close()
+
+    tokens_array = np.memmap(temp_path, dtype=np.uint16, mode='w+', shape=(capacity,))
+    
+    logger.info(f"Starting tokenization with initial capacity: {initial_capacity:,}")
+
+    with open("./data/TinyStoriesV2-GPT4-train.txt") as input_file:
+        for token_id in tokenizer.encode_iterable(input_file):
+            # Check if we need to grow the array
+            if token_count >= capacity:
+                new_capacity = capacity * 2
+                logger.info(f"Growing memmap from {capacity:,} to {new_capacity:,}")
+                
+                # Create new larger memmap
+                new_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.dat')
+                new_temp_path = new_temp_file.name
+                new_temp_file.close()
+                
+                new_tokens_array = np.memmap(new_temp_path, dtype=np.uint16, mode='w+', shape=(new_capacity,))
+                
+                # Copy existing data
+                new_tokens_array[:capacity] = tokens_array[:]
+                
+                # Clean up old memmap
+                del tokens_array
+                os.unlink(temp_path)
+                
+                # Switch to new memmap
+                tokens_array = new_tokens_array
+                temp_path = new_temp_path
+                capacity = new_capacity
+
+            tokens_array[token_count] = token_id
+            token_count += 1
+
+            # Log progress
+            if token_count % 100_000 == 0:
+                current_time = time.time()
+                elapsed_time = current_time - start_time
+                tokens_per_second = token_count / elapsed_time if elapsed_time > 0 else 0
+                logger.info(f"Tokens written: {token_count:,} | Rate: {tokens_per_second:,.0f} tokens/sec")
+
+    # Create final memmap with exact size  
+    output_path = "./data/tinystories_encoded.dat"
+    final_tokens = np.memmap(output_path, dtype=np.uint16, mode='w+', shape=(token_count,))
+    final_tokens[:] = tokens_array[:token_count]
+    final_tokens.flush()
+    
+    # Save metadata for loading later
+    metadata_path = "./data/tinystories_encoded_metadata.txt"
+    with open(metadata_path, 'w') as f:
+        f.write(f"tokens: {token_count}\n")
+        f.write(f"dtype: uint16\n")
+        f.write(f"shape: ({token_count},)\n")
+    
+    # Clean up temporary file
+    del tokens_array
+    del final_tokens
+    os.unlink(temp_path)
+
+    end_time = time.time()
+    total_time = end_time - start_time
+    tokens_per_second = token_count / total_time if total_time > 0 else 0
+
+    logger.info(f"Tokenization complete. Encoded tokens written to {output_path} in {total_time:.2f} seconds.")
+    logger.info(f"Total tokens: {token_count:,}")
+    logger.info(f"Tokenization rate: {tokens_per_second:,.0f} tokens/second")
+    
+    # Print file size info
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    logger.info(f"Output file size: {file_size_mb:.1f} MB")
+    logger.info("Storage per token: 2 bytes (uint16, memory-mapped)")
+    logger.info("Output saved as memory-mapped array with metadata file")

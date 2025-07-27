@@ -152,10 +152,10 @@ class OptimizedBPETrainer:
         input_filename = os.path.basename(input_path)
 
         self.output_vocab_path = (
-            f"/home/rjindal/local_code/cs336-stanford/assignment1-basics/data/bpe_vocab_{input_filename}.json"
+            f"/home/rjindal/local_code/cs336-stanford/assignment1-basics/data/bpe_vocab_{input_filename}.pkl"
         )
         self.output_merges_path = (
-            f"/home/rjindal/local_code/cs336-stanford/assignment1-basics/data/bpe_merges_{input_filename}.json"
+            f"/home/rjindal/local_code/cs336-stanford/assignment1-basics/data/bpe_merges_{input_filename}.pkl"
         )
 
     def find_chunk_boundaries(self, file: BinaryIO, desired_num_chunks: int, split_special_token: bytes) -> list[int]:
@@ -459,31 +459,30 @@ class OptimizedBPETrainer:
 
     def serialize(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]]):
         """
-        Serialize the vocabulary and merges to a format suitable for saving.
+        Serialize the vocabulary and merges to pickle files.
         """
-        import json
+        import pickle
 
-        vocab_json = {k: v.decode("utf-8", errors="replace") for k, v in vocab.items()}
-        merges_json = [
-            (pair[0].decode("utf-8", errors="replace"), pair[1].decode("utf-8", errors="replace")) for pair in merges
-        ]
+        # Save vocabulary as pickle
+        with open(self.output_vocab_path, "wb") as f:
+            pickle.dump(vocab, f)
 
-        with open(self.output_vocab_path, "w") as f:
-            json.dump(vocab_json, f, indent=2)
-
-        with open(self.output_merges_path, "w") as f:
-            json.dump(merges_json, f, indent=2)
+        # Save merges as pickle
+        with open(self.output_merges_path, "wb") as f:
+            pickle.dump(merges, f)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    text = "a quick brown fox jumps over the lazy dog. <|endoftext|> Another sentence. low lower lowest"
-    # put to a temp file for testing
-    with open("data/text.txt", "w") as f:
-        f.write(text)
+    # text = "a quick brown fox jumps over the lazy dog. <|endoftext|> Another sentence. low lower lowest"
+    # # put to a temp file for testing
+    # with open("data/text.txt", "w") as f:
+    #     f.write(text)
 
-    trainer = OptimizedBPETrainer(input_path="data/text.txt", vocab_size=500, special_tokens=["<|endoftext|>"])
+    trainer = OptimizedBPETrainer(
+        input_path="data/TinyStoriesV2-GPT4-train.txt", vocab_size=10_000, special_tokens=["<|endoftext|>"]
+    )
     vocab, merges = trainer.train()
     trainer.serialize(vocab, merges)
     logging.info("BPE training complete and results serialized.")
