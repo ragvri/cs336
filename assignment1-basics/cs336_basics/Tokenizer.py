@@ -248,7 +248,7 @@ if __name__ == "__main__":
     metadata_path = "./data/tinystories_encoded_metadata.txt"
     with open(metadata_path, 'w') as f:
         f.write(f"tokens: {token_count}\n")
-        f.write(f"dtype: uint16\n")
+        f.write("dtype: uint16\n")
         f.write(f"shape: ({token_count},)\n")
     
     # Clean up temporary file

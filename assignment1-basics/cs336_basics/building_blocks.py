@@ -1,13 +1,12 @@
 from collections.abc import Callable
 import os
-from typing import BinaryIO, Union
+from typing import BinaryIO
 import torch
 from torch import nn
 from einops import einsum, reduce, rearrange
 import math
 from torch import Tensor
 import numpy as np
-import click
 from jaxtyping import Float, Int, Bool
 
 
@@ -658,17 +657,12 @@ def load_data(
     start_indices = np.random.randint(0, len(x) - context_len, size=batch_size)
 
     # create input and target tensors
-    input_tensor = torch.tensor(
-        [x[start_idx : start_idx + context_len] for start_idx in start_indices],
-        dtype=torch.int32,
-        device=device,
-    )
+    input_data = np.array([x[start_idx : start_idx + context_len] for start_idx in start_indices])
+    input_tensor = torch.tensor(input_data, dtype=torch.int32, device=device)
+    
     # for each start index, the target is the next token in the sequence
-    target_tensor = torch.tensor(
-        [x[start_idx + 1 : start_idx + context_len + 1] for start_idx in start_indices],
-        dtype=torch.int32,
-        device=device,
-    )
+    target_data = np.array([x[start_idx + 1 : start_idx + context_len + 1] for start_idx in start_indices])
+    target_tensor = torch.tensor(target_data, dtype=torch.int32, device=device)
     return input_tensor, target_tensor
 
 
@@ -709,91 +703,6 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint["iteration"]  # return the iteration number from the checkpoint
-
-
-@click.command()
-@click.option("--dataset", type=str, required=True, help="Path to the dataset file.")
-@click.option("--batch_size", type=int, default=32, help="Batch size for training.")
-@click.option("--vocab_size", type=int, default=10000, help="Size of the vocabulary.")
-@click.option("--context_length", type=int, default=1024, help="Context length for the model.")
-@click.option("--d_model", type=int, default=512, help="Dimension of the model")
-@click.option("--num_layers", type=int, default=6, help="Number of transformer layers.")
-@click.option("--num_heads", type=int, default=8, help="Number of attention heads.")
-@click.option(
-    "--d_ff",
-    type=int,
-    default=None,
-    help="Hidden dimension for the feed-forward network. If None, defaults to 8/3 * d_model.",
-)
-@click.option("--rope_theta", type=float, default=None, help="Constant for the RoPE. If None, RoPE is disabled.")
-@click.option("--device", type=str, default="cpu", help="Device to run the training on (e.g., 'cpu' or 'cuda').")
-@click.option("--output_dir", type=str, default="checkpoints", help="Directory to save checkpoints.")
-@click.option("--iterations", type=int, default=1000, help="Number of training iterations.")
-def train(
-    dataset: str,
-    batch_size: int,
-    vocab_size: int,
-    context_length: int,
-    d_model: int,
-    num_layers: int,
-    num_heads: int,
-    d_ff: int | None = None,
-    rope_theta: float | None = None,
-    device: str = "cpu",
-    output_dir: str = "checkpoints",
-    iterations: int = 1000,
-):
-    """
-    Train a Transformer Language Model on the given dataset.
-    """
-    device = torch.device(device)
-
-    # Load dataset
-    x = np.memmap(dataset, dtype=np.int32, mode="r")
-    # Initialize model and optimizer
-    model = TransformerLM(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        context_length=context_length,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        d_ff=d_ff,
-        rope_theta=rope_theta,
-        device=device,
-    ).to(device)
-
-    for iteration in range(iterations):
-        # Load data
-        input_tensor, target_tensor = load_data(x, batch_size, context_length, device)
-
-        # Forward pass
-        logits = model(input_tensor)
-
-        # Compute loss
-        loss = cross_entropy_loss(logits.view(-1, vocab_size), target_tensor.view(-1))
-
-        lr = cosine_annealing_lr_schedule(
-            t=iteration,
-            alpha_max=1e-1,
-            alpha_min=1e-5,
-            warmup_steps=100,
-            cosine_annealing_steps=iterations,
-        )
-        optimizer = AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=1e-2)
-
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        gradient_clipping(model.parameters(), max_norm=4.0)
-        optimizer.step()
-
-        print(f"Iteration {iteration + 1}/{iterations}, Loss: {loss.item()}")
-
-        # Save checkpoint every 100 iterations
-        if (iteration + 1) % 100 == 0:
-            os.makedirs(output_dir, exist_ok=True)
-            checkpoint_path = os.path.join(output_dir, f"checkpoint_{iteration + 1}.pt")
-            save_checkpoint(model, optimizer, iteration + 1, checkpoint_path)
 
 
 if __name__ == "__main__":
