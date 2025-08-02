@@ -1,7 +1,11 @@
 import logging
-from collections.abc import Iterable
-from collections.abc import Iterator
+import os
+import tempfile
+import time
+from collections.abc import Iterable, Iterator
 
+import click
+import numpy as np
 import regex as re
 
 logger = logging.getLogger(__name__)
@@ -169,27 +173,29 @@ class Tokenizer:
         return b"".join(encoded_tokens).decode("utf-8", errors="replace")
 
 
-if __name__ == "__main__":
-    # text = "the cat ate"
-    # vocab = {0: b" ", 1: b"a", 2: b"c", 3: b"e", 4: b"h", 5: b"t", 6: b"th", 7: b" c", 8: b" a", 9: b"the", 10: b" at"}
-    # merges = [(b"t", b"h"), (b" ", b"c"), (b" ", b"a"), (b"th", b"e"), (b" a", b"t")]
-    # tokenizer = Tokenizer(vocab=vocab, merges=merges, special_tokens={})
-    # encoded = tokenizer.encode(text)
-    import time
 
+@click.command()
+@click.option("--vocab_filepath", default="./data/bpe_vocab_TinyStoriesV2-GPT4-train.txt.pkl", help="Path to vocabulary file")
+@click.option("--merges_filepath", default="./data/bpe_merges_TinyStoriesV2-GPT4-train.txt.pkl", help="Path to merges file")
+@click.option("--input_filepath", default="./data/TinyStoriesV2-GPT4-train.txt", help="Path to input text file")
+@click.option("--output_filepath", default="./data/tinystories_encoded.dat", help="Path to output encoded file")
+@click.option("--metadata_filepath", default="./data/tinystories_encoded_metadata.txt", help="Path to metadata file")
+@click.option("--initial_capacity", default=10_000_000, help="Initial capacity for memory-mapped array")
+@click.option("--special_tokens", default="<|endoftext|>", help="Special tokens (comma-separated)")
+def main(vocab_filepath, merges_filepath, input_filepath, output_filepath, metadata_filepath, initial_capacity, special_tokens):
+    """Tokenize text file and save as memory-mapped array."""
+    
+    # Parse special tokens
+    special_tokens_list = [token.strip() for token in special_tokens.split(",")] if special_tokens else []
+    
     start_time = time.time()
     tokenizer = Tokenizer.from_files(
-        vocab_filepath="./data/bpe_vocab_TinyStoriesV2-GPT4-train.txt.pkl",
-        merges_filepath="./data/bpe_merges_TinyStoriesV2-GPT4-train.txt.pkl",
-        special_tokens=["<|endoftext|>"],
+        vocab_filepath=vocab_filepath,
+        merges_filepath=merges_filepath,
+        special_tokens=special_tokens_list,
     )
 
-    import numpy as np
-    import os
-    import tempfile
-
     # Dynamic memory-mapped array approach
-    initial_capacity = 10_000_000  # Start with 10M tokens (20MB)
     capacity = initial_capacity
     token_count = 0
 
@@ -202,7 +208,7 @@ if __name__ == "__main__":
     
     logger.info(f"Starting tokenization with initial capacity: {initial_capacity:,}")
 
-    with open("./data/TinyStoriesV2-GPT4-train.txt") as input_file:
+    with open(input_filepath) as input_file:
         for token_id in tokenizer.encode_iterable(input_file):
             # Check if we need to grow the array
             if token_count >= capacity:
@@ -239,14 +245,12 @@ if __name__ == "__main__":
                 logger.info(f"Tokens written: {token_count:,} | Rate: {tokens_per_second:,.0f} tokens/sec")
 
     # Create final memmap with exact size  
-    output_path = "./data/tinystories_encoded.dat"
-    final_tokens = np.memmap(output_path, dtype=np.uint16, mode='w+', shape=(token_count,))
+    final_tokens = np.memmap(output_filepath, dtype=np.uint16, mode='w+', shape=(token_count,))
     final_tokens[:] = tokens_array[:token_count]
     final_tokens.flush()
     
     # Save metadata for loading later
-    metadata_path = "./data/tinystories_encoded_metadata.txt"
-    with open(metadata_path, 'w') as f:
+    with open(metadata_filepath, 'w') as f:
         f.write(f"tokens: {token_count}\n")
         f.write("dtype: uint16\n")
         f.write(f"shape: ({token_count},)\n")
@@ -260,12 +264,16 @@ if __name__ == "__main__":
     total_time = end_time - start_time
     tokens_per_second = token_count / total_time if total_time > 0 else 0
 
-    logger.info(f"Tokenization complete. Encoded tokens written to {output_path} in {total_time:.2f} seconds.")
+    logger.info(f"Tokenization complete. Encoded tokens written to {output_filepath} in {total_time:.2f} seconds.")
     logger.info(f"Total tokens: {token_count:,}")
     logger.info(f"Tokenization rate: {tokens_per_second:,.0f} tokens/second")
     
     # Print file size info
-    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    file_size_mb = os.path.getsize(output_filepath) / (1024 * 1024)
     logger.info(f"Output file size: {file_size_mb:.1f} MB")
     logger.info("Storage per token: 2 bytes (uint16, memory-mapped)")
     logger.info("Output saved as memory-mapped array with metadata file")
+
+
+if __name__ == "__main__":
+    main()
