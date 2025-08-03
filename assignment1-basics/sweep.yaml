@@ -1,0 +1,51 @@
+# final_sweep.yaml
+
+program: cs336_basics/train.py
+
+# This command uses the ABSOLUTE PATH to the wrapper script.
+# This cannot fail, no matter what the agent's current directory is.
+command:
+  - /home/rjindal/local_code/cs336-stanford/assignment1-basics/run.sh
+  - ${program}
+  - ${args}
+
+method: grid
+name: lr_sweep
+project: cs336-assignment1
+
+metric:
+  goal: minimize
+  name: loss
+
+parameters:
+  # All your parameters are the same
+  alpha_max:
+    values: [1e-1, 5e-2, 1e-2, 5e-3, 1e-3]
+  alpha_min:
+    values: [1e-5, 1e-6, 1e-7]
+  dataset:
+    value: "/home/rjindal/local_code/cs336-stanford/assignment1-basics/data/tinystories_encoded.dat"
+  output_dir:
+    value: "/home/rjindal/local_code/cs336-stanford/assignment1-basics/checkpoints"
+  device:
+    value: "cuda"
+  batch_size:
+    value: 32
+  vocab_size:
+    value: 10000
+  context_length:
+    value: 256
+  d_model:
+    value: 512
+  num_layers:
+    value: 4
+  num_heads:
+    value: 16
+  d_ff:
+    value: 1344
+  rope_theta:
+    value: 10000
+  iterations:
+    value: 20000
+  wandb_project:
+    value: "cs336-assignment1"
