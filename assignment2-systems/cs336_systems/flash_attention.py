@@ -73,7 +73,7 @@ class FlashAttention(torch.autograd.Function):
                 V_j = V[j * B_k : min((j + 1) * B_k, n_v), :]  # (B_k, d)
                 actual_B_k = K_j.shape[0]  # actual size might be smaller for last tile
 
-                # Compute pre-softmax scores S_i^j = Q_i K_j^T/sqrt(d) shape (B_q, B_k).
+                # Compute pre-softmax scores S_ij = Q_i K_j^T/sqrt(d) shape (B_q, B_k).
                 S_ij = einsum(Q_i, K_j, "q d, k d -> q k") / math.sqrt(d)
 
                 # Apply causal mask if needed
@@ -123,7 +123,7 @@ class FlashAttention(torch.autograd.Function):
         K: Float[Tensor, "batch n_k d"],
         V: Float[Tensor, "batch n_v d"],
         is_causal: bool = False,
-    ) -> Tensor:  # attention output (batch,n_q,d)
+    ) -> Tensor:
         batch, n_q, d = Q.shape
         _, n_k, _ = K.shape
         _, n_v, __ = V.shape
@@ -143,13 +143,41 @@ class FlashAttention(torch.autograd.Function):
         return output
 
     @staticmethod
+    @torch.compile
     def backward(
         ctx: FunctionCtx,
         grad_output: Tensor,
-        grad_L: Tensor,
-    ) -> tuple[None, None, None, None]:
-        # TODO: implement backward pass; currently returns no gradients
-        raise NotImplementedError()
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        Q, K, V, output, L = ctx.saved_tensors
+        dO = grad_output
+
+        batch, nq, d = Q.shape
+        scale = 1.0 / math.sqrt(d)
+
+        # D = sum(do * O)
+        D = einsum(dO, output, "b q d, b q d -> b q")
+
+        # Recompute S = QK^T/sqrt(d)
+        S = einsum(Q, K, "b q d, b k d -> b q k") * scale  # (b, n_q, n_k)
+
+        # recompute P  = exp(S - L)
+        P = torch.exp(S - rearrange(L, "b q -> b q 1"))  # (b, n_q, n_k)
+
+        # dV = P^T dO
+        dV = einsum(P, dO, "b q k, b q d -> b k d")
+
+        # dP = dO V^T
+        dP = einsum(dO, V, "b q d, b k d -> b q k")
+
+        # dS = P * (dP - D)  (elementwise)
+        dS = P * (dP - D.unsqueeze(-1))
+
+        # dQ = dS K / sqrt(d)
+        dQ = einsum(dS, K, "b q k, b k d -> b q d") * scale
+
+        dK = einsum(rearrange(dS, "b q k -> b k q"), Q, "b k q, b q d -> b k d") * scale
+
+        return dQ, dK, dV, None
 
 
 @triton.jit
@@ -353,50 +381,3 @@ class FlashAttentionTriton(torch.autograd.Function):
     ) -> tuple[None, None, None, None]:
         # TODO: implement backward pass; currently returns no gradients
         raise NotImplementedError()
-
-
-def reference_attention(
-    Q: Float[Tensor, "batch n_q d"],
-    K: Float[Tensor, "batch n_k d"],
-    V: Float[Tensor, "batch n_v d"],
-    is_causal: bool = False,
-) -> tuple[Tensor, Tensor]:
-    """
-    Reference implementation of standard attention (Equations 4-6, 12 from FlashAttention paper).
-
-    This implements:
-    - Equation 4: S = QK^T / √d
-    - Equation 5: Apply causal mask if needed
-    - Equation 6: P = softmax(S)
-    - Equation 12: O = PV
-
-    Returns:
-        output: Attention output of shape (batch, n_q, d)
-        L: Log-sum-exp values of shape (batch, n_q)
-    """
-    batch, n_q, d = Q.shape
-    _, n_k, _ = K.shape
-
-    # Equation 4: S = QK^T / √d
-    S = torch.einsum("bqd,bkd->bqk", Q, K) / math.sqrt(d)
-
-    # Equation 5: Apply causal mask if needed
-    if is_causal:
-        # Create causal mask: position i can only attend to positions <= i
-        mask = torch.triu(torch.ones(n_q, n_k, device=Q.device, dtype=torch.bool), diagonal=1)
-        S = S.masked_fill(mask[None, :, :], -float("inf"))
-
-    # Compute log-sum-exp for numerical stability
-    # L = logsumexp(S, dim=-1) = max(S, dim=-1) + log(sum(exp(S - max), dim=-1))
-    max_S = torch.max(S, dim=-1, keepdim=True)[0]  # (batch, n_q, 1)
-    exp_S = torch.exp(S - max_S)  # (batch, n_q, n_k)
-    sum_exp_S = torch.sum(exp_S, dim=-1, keepdim=True)  # (batch, n_q, 1)
-    L = max_S.squeeze(-1) + torch.log(sum_exp_S.squeeze(-1))  # (batch, n_q)
-
-    # Equation 6: P = softmax(S) = exp(S - logsumexp(S))
-    P = exp_S / sum_exp_S  # (batch, n_q, n_k)
-
-    # Equation 12: O = PV
-    output = torch.einsum("bqk,bkd->bqd", P, V)  # (batch, n_q, d)
-
-    return output, L
